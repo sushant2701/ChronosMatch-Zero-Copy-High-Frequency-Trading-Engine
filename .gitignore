@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions and compiled binaries
+*.so
+*.pyd
+*.c
+*.html
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Shared memory & IPC files
+*.mmap
+*.ipc
+*.dat
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# IDE & Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log

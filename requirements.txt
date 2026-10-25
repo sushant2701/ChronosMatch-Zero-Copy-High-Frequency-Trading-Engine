@@ -1,0 +1,9 @@
+# Core Runtime Dependencies
+windows-curses>=2.3.3; sys_platform == 'win32'
+
+# Development & Testing Tooling
+pytest>=8.0.0
+pytest-cov>=4.1.0
+black>=24.0.0
+flake8>=7.0.0
+cython>=3.0.0
