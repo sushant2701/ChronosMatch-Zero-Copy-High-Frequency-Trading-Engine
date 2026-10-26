@@ -4,9 +4,12 @@ Market Simulator Configuration and Execution Statistics.
 Provides structured configuration parameters and empirical metrics reporting for
 the synthetic market order stream in ChronosMatch.
 """
-
+import random
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
+
+from chronosmatch.codec import OrderRecord, OrderSide
 
 
 @dataclass
@@ -111,3 +114,104 @@ class SimulatorStats:
         else:
             self.achieved_rate = 0.0
         return self.achieved_rate
+
+
+class MarketOrderGenerator:
+    """
+    Deterministic synthetic market order generator based on a drifting random walk.
+
+    Uses an isolated random.Random instance to prevent global RNG interference,
+    ensuring that a given seed generates an identical, reproducible sequence of orders.
+
+    Design Rationale:
+        - Isolated RNG: Keeps test runs completely deterministic and repeatable.
+        - Ticks as Integers: Prices and quantities use integer ticks, eliminating
+          floating-point rounding inaccuracies in financial computations.
+        - Monotonic Clock Injection: Allows injecting mock clocks for test assertions
+          while defaulting to hardware monotonic nanoseconds (time.perf_counter_ns).
+    """
+
+    def __init__(
+        self,
+        config: Optional[SimulatorConfig] = None,
+        clock: Optional[Callable[[], int]] = None,
+    ) -> None:
+        """
+        Initialize order generator.
+
+        Args:
+            config: Simulator configuration settings. Defaults to standard config if None.
+            clock: Monotonic nanosecond timestamp callable. Defaults to time.perf_counter_ns.
+        """
+        self.config: SimulatorConfig = config or SimulatorConfig()
+        self._clock = clock if clock is not None else time.perf_counter_ns
+        self._rng: random.Random = random.Random(self.config.seed)
+        self._mid_price: float = float(self.config.initial_price)
+        self._next_order_id: int = 1
+
+    @property
+    def current_mid_price(self) -> float:
+        """Current floating-point mid price."""
+        return self._mid_price
+
+    def reset(self) -> None:
+        """Reset generator back to initial configuration, price, and RNG state."""
+        self._rng = random.Random(self.config.seed)
+        self._mid_price = float(self.config.initial_price)
+        self._next_order_id = 1
+
+    def generate_order(self) -> OrderRecord:
+        """
+        Generate a single synthetic OrderRecord around the drifting mid-price.
+
+        Returns:
+            OrderRecord: Validated, immutable 29-byte order record.
+        """
+        # Step 1: Evolve mid-price via discrete Gaussian random walk
+        drift = self._rng.gauss(0.0, self.config.drift_std)
+        self._mid_price = max(
+            float(self.config.min_price),
+            min(float(self.config.max_price), self._mid_price + drift),
+        )
+        mid_tick = int(round(self._mid_price))
+
+        # Step 2: Determine order side (50/50 BUY/SELL balance)
+        side = OrderSide.BUY if self._rng.random() < 0.5 else OrderSide.SELL
+
+        # Step 3: Compute price with spread offset
+        spread_offset = self._rng.randint(0, self.config.spread)
+        if side == OrderSide.BUY:
+            # Bids placed at or below mid-price
+            price = max(self.config.min_price, mid_tick - spread_offset)
+        else:
+            # Asks placed at or above mid-price
+            price = min(self.config.max_price, mid_tick + spread_offset)
+
+        # Step 4: Random quantity within configured lot bounds
+        quantity = self._rng.randint(self.config.min_quantity, self.config.max_quantity)
+
+        # Step 5: Monotonic order identifier and nanosecond timestamp
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        timestamp_ns = self._clock()
+
+        return OrderRecord(
+            order_id=order_id,
+            side=side,
+            price=price,
+            quantity=quantity,
+            timestamp_ns=timestamp_ns,
+        )
+
+    def generate_batch(self, count: int) -> list[OrderRecord]:
+        """
+        Generate a batch of synthetic orders.
+
+        Args:
+            count: Number of orders to generate.
+
+        Returns:
+            list[OrderRecord]: Sequence of generated order records.
+        """
+        return [self.generate_order() for _ in range(count)]
+
