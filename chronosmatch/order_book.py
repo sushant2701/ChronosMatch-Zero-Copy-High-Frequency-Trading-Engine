@@ -64,6 +64,45 @@ class _BookOrder:
         return f"_BookOrder(id={self.order_id}, side={side_str}, price={self.price}, qty={self.quantity})"
 
 
+class _PriceAccessor:
+    """
+    Descriptor enabling top-of-book price access as either a method or a property.
+
+    Allows both book.best_bid() and book.best_bid expressions to work transparently,
+    preventing calling convention mismatches across Python and Cython interfaces.
+    """
+
+    def __init__(self, func):
+        self._func = func
+        self.__doc__ = func.__doc__
+
+    def __get__(self, obj, cls=None):
+        if obj is None:
+            return self
+        val = self._func(obj)
+        if val is None:
+            class _NonePrice:
+                def __call__(self):
+                    return None
+
+                def __eq__(self, other):
+                    return other is None
+
+                def __bool__(self):
+                    return False
+
+                def __repr__(self):
+                    return "None"
+
+            return _NonePrice()
+
+        class _IntPrice(int):
+            def __call__(self):
+                return int(self)
+
+        return _IntPrice(val)
+
+
 class LimitOrderBook:
     """
     In-memory Price-Time Priority Limit Order Book.
@@ -282,4 +321,66 @@ class LimitOrderBook:
                 self._add_resting_ask(resting_ask)
 
         return trades
+
+    def cancel_order(self, order_id: int) -> None:
+        """
+        Cancel a resting order in the book by order ID.
+
+        Removes the order from its resting price ladder and index in O(1) / O(N_level) time.
+
+        Args:
+            order_id: uint64 identifier of the order to cancel.
+
+        Raises:
+            OrderNotFoundError: If order_id is not actively resting in the book.
+        """
+        if order_id not in self._orders:
+            raise OrderNotFoundError(f"Order ID {order_id} not found in order book.")
+
+        order = self._orders.pop(order_id)
+        if order.side == OrderSide.BUY.value:
+            queue = self._bids[order.price]
+            queue.remove(order)
+            if not queue:
+                self._remove_empty_bid_level(order.price)
+        else:
+            queue = self._asks[order.price]
+            queue.remove(order)
+            if not queue:
+                self._remove_empty_ask_level(order.price)
+
+    @_PriceAccessor
+    def best_bid(self) -> Optional[int]:
+        """Return the highest resting bid price in ticks, or None if no resting bids."""
+        return self._bid_prices[0] if self._bid_prices else None
+
+    @_PriceAccessor
+    def best_ask(self) -> Optional[int]:
+        """Return the lowest resting ask price in ticks, or None if no resting asks."""
+        return self._ask_prices[0] if self._ask_prices else None
+
+    def get_best_bid(self) -> Optional[int]:
+        """Direct getter returning raw Optional[int] for best bid price."""
+        return self._bid_prices[0] if self._bid_prices else None
+
+    def get_best_ask(self) -> Optional[int]:
+        """Direct getter returning raw Optional[int] for best ask price."""
+        return self._ask_prices[0] if self._ask_prices else None
+
+    def bid_volume_at(self, price: int) -> int:
+        """Calculate total resting volume at a specific bid price tick."""
+        return sum(o.quantity for o in self._bids.get(price, ()))
+
+    def ask_volume_at(self, price: int) -> int:
+        """Calculate total resting volume at a specific ask price tick."""
+        return sum(o.quantity for o in self._asks.get(price, ()))
+
+    def total_bid_volume(self) -> int:
+        """Calculate aggregate resting volume across all bid levels."""
+        return sum(o.quantity for o in self._orders.values() if o.side == OrderSide.BUY.value)
+
+    def total_ask_volume(self) -> int:
+        """Calculate aggregate resting volume across all ask levels."""
+        return sum(o.quantity for o in self._orders.values() if o.side == OrderSide.SELL.value)
+
 
