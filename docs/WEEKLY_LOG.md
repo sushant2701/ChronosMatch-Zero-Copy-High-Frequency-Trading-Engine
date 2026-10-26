@@ -24,3 +24,20 @@
 - **Roadblocks & Resolutions:**
   - Standard Windows non-elevated user permissions initially blocked system-wide MSI installation; resolved by executing user-scoped silent installation for Python and MinGit.
   - Multiprocessing queue feeder thread join order on Windows; resolved by consuming test queue payloads prior to process join.
+
+### Day 2 — 26/10/2026
+- **Tasks Completed:**
+  - Implemented asyncio market simulator (`chronosmatch/simulator.py`) with `SimulatorConfig` and `SimulatorStats` dataclasses, full domain validation, and configurable target rate (100,000 orders/sec).
+  - Built seeded `MarketOrderGenerator` using an isolated `random.Random` instance with Gaussian random walk mid-price evolution, ensuring identical seeds produce identical order sequences.
+  - Implemented asyncio simulation loop writing orders into the ring buffer with cooperative rate pacing, non-blocking `try_write()` with configurable back-off retries, and graceful dropped order counting (never crashes on buffer saturation).
+  - Implemented pure-Python Limit Order Book (`chronosmatch/order_book.py`) with strict Price-Time Priority (FIFO) matching, sorted price ladders via `bisect`, O(1) FIFO deque queues per price level, and `__slots__`-optimised `_BookOrder` containers.
+  - Order book operations: `add_order` (with crossing/matching), `cancel_order`, `best_bid`, `best_ask`, partial fills, full fills, and volume queries.
+  - Custom exceptions: `InvalidOrderError` for zero quantity/price, `OrderNotFoundError` for unknown cancel IDs.
+  - Authored comprehensive test suites: 9 order book tests (empty state, validation, full fill, partial fill, price priority, time priority, cancel, unknown cancel, multi-level crossing sweep) and 7 simulator tests (seed determinism, reset/divergence, config validation, rate computation, duration execution, full-buffer back-off, producer-consumer recovery).
+  - Updated `docs/CODE_WALKTHROUGH.md` with detailed simulator and order book module explanations.
+  - Updated `docs/REFERENCES.md` with asyncio cooperative scheduling, random walk simulation, and bisect sorted container references plus stdlib design foundations table.
+  - Updated `docs/AI_USAGE.md` with Day 2 session log.
+- **Test Results:** 33 tests passed, 0 failures in 2.27s.
+- **Roadblocks & Resolutions:**
+  - PowerShell `&&` operator not available in older PS versions; resolved by using sequential command execution.
+  - Asyncio event loop timer granularity on Windows (15ms quant) limits sub-millisecond `sleep()` precision; resolved by using cooperative `asyncio.sleep(0)` yields with batch processing to achieve high throughput without relying on fine-grained OS timers.
