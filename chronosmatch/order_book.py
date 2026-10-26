@@ -160,3 +160,126 @@ class LimitOrderBook:
             idx = bisect.bisect_left(self._ask_prices, price)
             if idx < len(self._ask_prices) and self._ask_prices[idx] == price:
                 self._ask_prices.pop(idx)
+
+    def add_order(self, order: OrderRecord) -> List[Trade]:
+        """
+        Process an incoming limit order with strict Price-Time Priority matching.
+
+        Algorithm:
+            1. Validate order parameters (positive quantity, positive price, valid side).
+            2. If BUY:
+               - Attempt crossing against resting asks where ask_price <= order.price.
+               - Ascending price priority (lowest ask matches first).
+               - FIFO queue priority at each ask price level.
+               - Matched trades execute at the resting passive order's price.
+               - Any remaining un-filled quantity rests on the bid book.
+            3. If SELL:
+               - Attempt crossing against resting bids where bid_price >= order.price.
+               - Descending price priority (highest bid matches first).
+               - FIFO queue priority at each bid price level.
+               - Matched trades execute at the resting passive order's price.
+               - Any remaining un-filled quantity rests on the ask book.
+
+        Args:
+            order: Incoming OrderRecord instance.
+
+        Returns:
+            List[Trade]: Chronological sequence of executed trade records.
+
+        Raises:
+            InvalidOrderError: If quantity or price is not positive, or side is invalid.
+        """
+        self._validate_order(order)
+        trades: List[Trade] = []
+        remaining_qty = order.quantity
+
+        if order.side == OrderSide.BUY.value:
+            # Match against resting asks
+            while remaining_qty > 0 and self._ask_prices:
+                best_ask = self._ask_prices[0]
+                if best_ask > order.price:
+                    # Best ask is higher than incoming buy limit price: no more matches
+                    break
+
+                queue = self._asks[best_ask]
+                while queue and remaining_qty > 0:
+                    resting_order = queue[0]
+                    match_qty = min(remaining_qty, resting_order.quantity)
+                    trade_price = resting_order.price
+
+                    trades.append(
+                        Trade(
+                            buy_order_id=order.order_id,
+                            sell_order_id=resting_order.order_id,
+                            price=trade_price,
+                            quantity=match_qty,
+                        )
+                    )
+
+                    remaining_qty -= match_qty
+                    resting_order.quantity -= match_qty
+
+                    if resting_order.quantity == 0:
+                        queue.popleft()
+                        del self._orders[resting_order.order_id]
+
+                if not queue:
+                    self._remove_empty_ask_level(best_ask)
+
+            # Rest any remaining unfilled quantity on the bid ladder
+            if remaining_qty > 0:
+                resting_bid = _BookOrder(
+                    order_id=order.order_id,
+                    side=order.side,
+                    price=order.price,
+                    quantity=remaining_qty,
+                    timestamp_ns=order.timestamp_ns,
+                )
+                self._add_resting_bid(resting_bid)
+
+        else:
+            # Match against resting bids
+            while remaining_qty > 0 and self._bid_prices:
+                best_bid = self._bid_prices[0]
+                if best_bid < order.price:
+                    # Best bid is lower than incoming sell limit price: no more matches
+                    break
+
+                queue = self._bids[best_bid]
+                while queue and remaining_qty > 0:
+                    resting_order = queue[0]
+                    match_qty = min(remaining_qty, resting_order.quantity)
+                    trade_price = resting_order.price
+
+                    trades.append(
+                        Trade(
+                            buy_order_id=resting_order.order_id,
+                            sell_order_id=order.order_id,
+                            price=trade_price,
+                            quantity=match_qty,
+                        )
+                    )
+
+                    remaining_qty -= match_qty
+                    resting_order.quantity -= match_qty
+
+                    if resting_order.quantity == 0:
+                        queue.popleft()
+                        del self._orders[resting_order.order_id]
+
+                if not queue:
+                    self._remove_empty_bid_level(best_bid)
+
+            # Rest any remaining unfilled quantity on the ask ladder
+            if remaining_qty > 0:
+                resting_ask = _BookOrder(
+                    order_id=order.order_id,
+                    side=order.side,
+                    price=order.price,
+                    quantity=remaining_qty,
+                    timestamp_ns=order.timestamp_ns,
+                )
+                self._add_resting_ask(resting_ask)
+
+        return trades
+
