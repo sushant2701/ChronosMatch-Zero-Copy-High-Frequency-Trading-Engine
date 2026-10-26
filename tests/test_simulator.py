@@ -148,3 +148,96 @@ def test_simulator_duration_and_execution(tmp_path: Path) -> None:
         assert first_order.order_id == 1
         assert first_order.price > 0
         assert first_order.quantity > 0
+
+
+def test_simulator_full_buffer_backoff_and_drops(tmp_path: Path) -> None:
+    """
+    Verify that a full buffer does not crash the simulator.
+
+    The simulator must back off gracefully, record retries, and count dropped
+    orders once max_retries is reached without raising BufferFullError.
+    """
+    buffer_file = tmp_path / "saturated_bus.bin"
+    small_capacity = 32  # Small power-of-two buffer capacity
+
+    with RingBuffer(buffer_file, capacity=small_capacity, create=True) as rb:
+        config = SimulatorConfig(
+            initial_price=100_00,
+            target_rate=10_000,
+            duration_seconds=0.15,
+            batch_size=8,
+            max_retries=3,
+            backoff_delay_seconds=0.001,
+            seed=42,
+        )
+        sim = MarketSimulator(ring_buffer=rb, config=config)
+
+        # Run without any consumer draining the ring buffer
+        stats = asyncio.run(sim.run())
+
+        # The buffer must be completely full
+        assert rb.is_full()
+        assert stats.orders_sent == small_capacity
+
+        # Retries and drops must be tracked honestly
+        assert stats.retries > 0, "Expected retries to be incremented during saturation"
+        assert stats.dropped_orders > 0, "Expected dropped orders after max_retries exhausted"
+
+        # Verify all small_capacity orders in the buffer are intact
+        assert rb.available_to_read() == small_capacity
+        read_orders = [rb.read() for _ in range(small_capacity)]
+        assert len(read_orders) == small_capacity
+        assert read_orders[0].order_id == 1
+        assert read_orders[-1].order_id == small_capacity
+
+
+def test_simulator_full_buffer_recovery_with_consumer(tmp_path: Path) -> None:
+    """
+    Verify that when a consumer drains the buffer, the simulator successfully
+    resumes writing orders following back-off without crashing.
+    """
+    buffer_file = tmp_path / "concurrent_drain_bus.bin"
+    small_capacity = 16
+
+    async def _run_producer_and_consumer() -> tuple[SimulatorStats, int]:
+        with RingBuffer(buffer_file, capacity=small_capacity, create=True) as rb:
+            config = SimulatorConfig(
+                initial_price=100_00,
+                target_rate=5_000,
+                duration_seconds=0.2,
+                batch_size=4,
+                max_retries=10,
+                backoff_delay_seconds=0.002,
+                seed=77,
+            )
+            sim = MarketSimulator(ring_buffer=rb, config=config)
+            consumed_count = 0
+
+            async def consumer_task():
+                nonlocal consumed_count
+                start_c = asyncio.get_running_loop().time()
+                while asyncio.get_running_loop().time() - start_c < 0.25:
+                    while rb.available_to_read() > 0:
+                        order = rb.read()
+                        assert order.order_id > 0
+                        consumed_count += 1
+                    await asyncio.sleep(0.005)
+
+            # Run producer and consumer concurrently
+            c_task = asyncio.create_task(consumer_task())
+            stats = await sim.run()
+            await c_task
+
+            # Drain any remaining orders after simulation finishes
+            while rb.available_to_read() > 0:
+                rb.read()
+                consumed_count += 1
+
+            return stats, consumed_count
+
+    stats, total_consumed = asyncio.run(_run_producer_and_consumer())
+    assert stats.orders_sent > small_capacity, (
+        f"Expected orders_sent ({stats.orders_sent}) to exceed small buffer capacity ({small_capacity})"
+    )
+    assert total_consumed == stats.orders_sent
+
