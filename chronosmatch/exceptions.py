@@ -5,11 +5,13 @@ Hierarchy:
     ChronosMatchError (Base)
     ├── CodecError
     │   └── InvalidOrderError
-    └── RingBufferError
-        ├── BufferFullError
-        ├── BufferEmptyError
-        ├── CorruptBufferHeaderError
-        └── BufferClosedError
+    ├── RingBufferError
+    │   ├── BufferFullError
+    │   ├── BufferEmptyError
+    │   ├── CorruptBufferHeaderError
+    │   └── BufferClosedError
+    └── OrderBookError
+        └── OrderNotFoundError
 """
 
 
@@ -23,6 +25,14 @@ class CodecError(ChronosMatchError):
 
 class InvalidOrderError(CodecError):
     """Raised when order parameters violate schema or bounds constraints."""
+
+
+class OrderBookError(ChronosMatchError):
+    """Base exception for limit order book errors."""
+
+
+class OrderNotFoundError(OrderBookError):
+    """Raised when attempting an operation on an unknown or missing order ID."""
 
 
 class RingBufferError(ChronosMatchError):

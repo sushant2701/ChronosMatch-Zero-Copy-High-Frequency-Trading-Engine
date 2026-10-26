@@ -15,10 +15,14 @@ __all__ = [
     "BufferFullError",
     "BufferEmptyError",
     "CorruptBufferHeaderError",
+    "OrderBookError",
+    "OrderNotFoundError",
     "SimulatorConfig",
     "SimulatorStats",
     "MarketOrderGenerator",
     "MarketSimulator",
+    "Trade",
+    "LimitOrderBook",
 ]
 
 from chronosmatch.codec import OrderRecord, OrderSide
@@ -28,6 +32,8 @@ from chronosmatch.exceptions import (
     BufferFullError,
     BufferEmptyError,
     CorruptBufferHeaderError,
+    OrderBookError,
+    OrderNotFoundError,
 )
 from chronosmatch.simulator import (
     SimulatorConfig,
@@ -35,3 +41,4 @@ from chronosmatch.simulator import (
     MarketOrderGenerator,
     MarketSimulator,
 )
+from chronosmatch.order_book import Trade, LimitOrderBook
