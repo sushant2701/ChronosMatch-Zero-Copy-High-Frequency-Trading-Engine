@@ -1,7 +1,6 @@
 """
 Unit tests for the ChronosMatch pure-Python Limit Order Book.
 
-Part 1: Basic Matching, Partial Fills, and Priority Invariants.
 Verifies:
 1. Initial empty book state and top-of-book queries.
 2. Domain input validation and custom exception enforcement.
@@ -9,12 +8,14 @@ Verifies:
 4. Partial fill execution leaving remainder resting on the book.
 5. Price priority: best prices match before inferior prices.
 6. Time priority (FIFO): orders at the same price tick match in arrival order.
+7. Cancel removes a resting order, unknown cancel raises OrderNotFoundError.
+8. Aggressive order crossing multiple resting price levels in a single sweep.
 """
 
 import pytest
 
 from chronosmatch.codec import OrderRecord, OrderSide
-from chronosmatch.exceptions import InvalidOrderError
+from chronosmatch.exceptions import InvalidOrderError, OrderNotFoundError
 from chronosmatch.order_book import LimitOrderBook, Trade
 
 
@@ -198,3 +199,114 @@ def test_time_priority_at_same_price() -> None:
     # Remaining volume: bid2 has 3 lots left, bid3 has 15 lots left
     assert book.total_bid_volume() == 18
     assert book.order_count == 2
+
+
+def test_cancel_order_removes_resting_order() -> None:
+    """Verify cancel_order removes a resting order and updates book state."""
+    book = LimitOrderBook()
+
+    # Place two resting bids at different prices
+    bid_low = OrderRecord(
+        order_id=1, side=OrderSide.BUY, price=99_00, quantity=10, timestamp_ns=100
+    )
+    bid_high = OrderRecord(
+        order_id=2, side=OrderSide.BUY, price=101_00, quantity=20, timestamp_ns=200
+    )
+    book.add_order(bid_low)
+    book.add_order(bid_high)
+
+    assert book.order_count == 2
+    assert book.best_bid == 101_00
+    assert book.total_bid_volume() == 30
+
+    # Cancel the higher bid — best_bid should drop to the lower price
+    book.cancel_order(2)
+    assert book.order_count == 1
+    assert book.best_bid == 99_00
+    assert book.total_bid_volume() == 10
+    assert book.bid_volume_at(101_00) == 0
+
+    # Place and cancel a resting ask to verify ask-side cancellation
+    ask = OrderRecord(
+        order_id=3, side=OrderSide.SELL, price=105_00, quantity=15, timestamp_ns=300
+    )
+    book.add_order(ask)
+    assert book.best_ask == 105_00
+    assert book.order_count == 2
+
+    book.cancel_order(3)
+    assert book.order_count == 1
+    assert book.best_ask() is None
+    assert book.ask_volume_at(105_00) == 0
+
+
+def test_cancel_unknown_order_raises_not_found() -> None:
+    """Verify cancelling an order ID not in the book raises OrderNotFoundError."""
+    book = LimitOrderBook()
+
+    # No orders exist — any cancel should raise
+    with pytest.raises(OrderNotFoundError, match="not found"):
+        book.cancel_order(9999)
+
+    # Add an order, cancel it, then try to cancel the same ID again
+    order = OrderRecord(
+        order_id=7, side=OrderSide.BUY, price=100_00, quantity=5, timestamp_ns=100
+    )
+    book.add_order(order)
+    book.cancel_order(7)
+
+    with pytest.raises(OrderNotFoundError, match="not found"):
+        book.cancel_order(7)
+
+
+def test_multi_level_crossing_sweep() -> None:
+    """
+    Verify that an aggressive order crossing multiple resting price levels
+    produces the correct sequence of trades, each at the passive order's price.
+
+    Scenario: Three resting asks at prices 100, 101, 102. An aggressive buy
+    at price 103 for 25 lots should sweep through all three levels sequentially.
+    """
+    book = LimitOrderBook()
+
+    # Three resting asks at ascending prices
+    ask_100 = OrderRecord(
+        order_id=1, side=OrderSide.SELL, price=100_00, quantity=8, timestamp_ns=100
+    )
+    ask_101 = OrderRecord(
+        order_id=2, side=OrderSide.SELL, price=101_00, quantity=10, timestamp_ns=200
+    )
+    ask_102 = OrderRecord(
+        order_id=3, side=OrderSide.SELL, price=102_00, quantity=12, timestamp_ns=300
+    )
+    book.add_order(ask_100)
+    book.add_order(ask_101)
+    book.add_order(ask_102)
+
+    assert book.ask_level_count == 3
+    assert book.best_ask == 100_00
+
+    # Aggressive buy sweeping all three levels (8 + 10 + 7 remainder from 102)
+    aggressive_buy = OrderRecord(
+        order_id=4, side=OrderSide.BUY, price=103_00, quantity=25, timestamp_ns=400
+    )
+    trades = book.add_order(aggressive_buy)
+
+    # Must produce exactly three trades, one per crossed price level
+    assert len(trades) == 3
+
+    # Trade 1: sweeps all 8 lots at ask price 100_00
+    assert trades[0] == Trade(buy_order_id=4, sell_order_id=1, price=100_00, quantity=8)
+    # Trade 2: sweeps all 10 lots at ask price 101_00
+    assert trades[1] == Trade(buy_order_id=4, sell_order_id=2, price=101_00, quantity=10)
+    # Trade 3: partially fills 7 lots at ask price 102_00 (only 7 of 12 needed)
+    assert trades[2] == Trade(buy_order_id=4, sell_order_id=3, price=102_00, quantity=7)
+
+    # After sweep: ask at 102_00 should have 5 lots remaining (12 - 7)
+    assert book.order_count == 1
+    assert book.best_ask == 102_00
+    assert book.ask_volume_at(102_00) == 5
+
+    # No unfilled buy quantity should rest on the bid side
+    assert book.best_bid() is None
+    assert book.total_bid_volume() == 0
