@@ -4,12 +4,14 @@ Market Simulator Configuration and Execution Statistics.
 Provides structured configuration parameters and empirical metrics reporting for
 the synthetic market order stream in ChronosMatch.
 """
+import asyncio
 import random
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from chronosmatch.codec import OrderRecord, OrderSide
+from chronosmatch.ring_buffer import RingBuffer
 
 
 @dataclass
@@ -214,4 +216,132 @@ class MarketOrderGenerator:
             list[OrderRecord]: Sequence of generated order records.
         """
         return [self.generate_order() for _ in range(count)]
+
+
+class MarketSimulator:
+    """
+    Asynchronous high-frequency market order simulator.
+
+    Streams synthetic orders directly into a file-backed zero-copy RingBuffer
+    using cooperative asyncio scheduling, rate-pacing, and non-blocking back-off.
+
+    Design Rationale:
+        - Cooperative Asyncio Batching: Standard OS timers cannot sleep for sub-millisecond
+          durations (target 100k orders/sec requires ~10 microseconds per order). Pacing in
+          batches with asyncio.sleep(0) cooperative yields ensures high throughput while
+          preventing starvation of the event loop.
+        - Non-Blocking RingBuffer Writes: Utilizes try_write() to attempt zero-copy writes.
+          If the buffer is saturated, backs off gracefully with tracked retries rather than
+          crashing with BufferFullError.
+        - Verifiable Real Metrics: Computes true elapsed wall-clock time and genuine
+          achieved order rates using time.perf_counter().
+    """
+
+    def __init__(
+        self,
+        ring_buffer: RingBuffer,
+        config: Optional[SimulatorConfig] = None,
+        generator: Optional[MarketOrderGenerator] = None,
+    ) -> None:
+        """
+        Initialize the Market Simulator.
+
+        Args:
+            ring_buffer: The target SPSC ring buffer for binary order payloads.
+            config: Simulator configuration settings.
+            generator: Order generator instance (defaults to a new seeded generator).
+        """
+        self.ring_buffer: RingBuffer = ring_buffer
+        self.config: SimulatorConfig = config or SimulatorConfig()
+        self.generator: MarketOrderGenerator = generator or MarketOrderGenerator(self.config)
+        self.stats: SimulatorStats = SimulatorStats()
+
+    async def run(
+        self,
+        max_orders: Optional[int] = None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> SimulatorStats:
+        """
+        Run the market order simulation loop.
+
+        Args:
+            max_orders: Optional maximum order count limit before stopping.
+            stop_event: Optional asyncio Event to request graceful early termination.
+
+        Returns:
+            SimulatorStats: Real collected statistics including orders sent, retries,
+                           dropped orders, elapsed time, and honest achieved rate.
+        """
+        self.stats = SimulatorStats()
+        start_time = time.perf_counter()
+        target_rate = float(self.config.target_rate)
+        duration = float(self.config.duration_seconds)
+        batch_size = self.config.batch_size
+        max_retries = self.config.max_retries
+        backoff_delay = self.config.backoff_delay_seconds
+
+        orders_attempted = 0
+
+        while True:
+            # Check termination conditions
+            now = time.perf_counter()
+            elapsed = now - start_time
+            if elapsed >= duration:
+                break
+            if stop_event is not None and stop_event.is_set():
+                break
+            if max_orders is not None and self.stats.orders_sent >= max_orders:
+                break
+
+            # Determine batch count for current iteration
+            current_batch = batch_size
+            if max_orders is not None:
+                remaining = max_orders - self.stats.orders_sent
+                if remaining <= 0:
+                    break
+                current_batch = min(current_batch, remaining)
+
+            for _ in range(current_batch):
+                order = self.generator.generate_order()
+                orders_attempted += 1
+
+                # Attempt non-blocking write with back-off
+                written = False
+                for attempt in range(max_retries + 1):
+                    if self.ring_buffer.try_write(order):
+                        self.stats.orders_sent += 1
+                        written = True
+                        break
+                    else:
+                        self.stats.retries += 1
+                        if attempt < max_retries:
+                            if backoff_delay > 0:
+                                await asyncio.sleep(backoff_delay)
+                            else:
+                                await asyncio.sleep(0)
+
+                if not written:
+                    self.stats.dropped_orders += 1
+
+                if max_orders is not None and self.stats.orders_sent >= max_orders:
+                    break
+
+            # Cooperative rate pacing
+            now = time.perf_counter()
+            elapsed = now - start_time
+            expected_time = orders_attempted / target_rate
+            ahead = expected_time - elapsed
+
+            if ahead > 0.001:  # Ahead by more than 1ms
+                await asyncio.sleep(ahead)
+            else:
+                # Cooperative yield to prevent event loop starvation
+                await asyncio.sleep(0)
+
+        # Finalize statistics with real elapsed time
+        end_time = time.perf_counter()
+        self.stats.elapsed_time = end_time - start_time
+        self.stats.compute_achieved_rate()
+        return self.stats
+
 
