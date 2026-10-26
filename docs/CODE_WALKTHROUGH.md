@@ -63,4 +63,50 @@ Provides clean, reusable multiprocessing worker targets (`run_ipc_producer` and 
 ## 4. `chronosmatch/exceptions.py` (Domain Exceptions)
 
 ### Why this module exists:
-Provides an explicit, fine-grained exception hierarchy rooted at `ChronosMatchError`. Allows client code to distinguish between serialization errors (`InvalidOrderError`), buffer capacity issues (`BufferFullError`), and structural data corruption (`CorruptBufferHeaderError`).
+Provides an explicit, fine-grained exception hierarchy rooted at `ChronosMatchError`. Allows client code to distinguish between serialization errors (`InvalidOrderError`), buffer capacity issues (`BufferFullError`), order book lookup failures (`OrderNotFoundError`), and structural data corruption (`CorruptBufferHeaderError`).
+
+---
+
+## 5. `chronosmatch/simulator.py` (Asyncio Market Simulator)
+
+### Why this module exists:
+Before building the real matching engine, we need a realistic, high-throughput source of synthetic order flow to stress-test the ring buffer and benchmark latency. The simulator acts as the "producer" half of the SPSC pipeline.
+
+### How it works:
+- **SimulatorConfig Dataclass:**
+  - Centralises every tuneable parameter — initial mid-price, drift standard deviation, spread, quantity range, target order rate (100 000 orders/sec), simulation duration, random seed, batch size, and back-off retry limits — with full domain validation in `__post_init__`.
+- **MarketOrderGenerator (Seeded Random Walk):**
+  - Uses an *isolated* `random.Random` instance seeded with `config.seed`. Because the RNG is private, global random state from other modules cannot interfere, guaranteeing that a given seed always produces the identical order sequence.
+  - Each call to `generate_order()` first evolves a floating-point mid-price by a discrete Gaussian step (`gauss(0, drift_std)`), clamped to `[min_price, max_price]`. A buy order is placed at or below mid, a sell at or above mid, with a random spread offset. Quantity is uniform-random within `[min_quantity, max_quantity]`.
+  - The monotonic nanosecond timestamp is taken from an injectable clock callable (defaults to `time.perf_counter_ns`), enabling deterministic timestamp injection in tests.
+- **MarketSimulator (Asyncio Loop with Back-Off):**
+  - Generates orders in configurable batch sizes. After each batch, the loop calculates how far ahead of the pacing target it is (`expected_time − elapsed`) and yields with `asyncio.sleep(ahead)` if leading by more than 1 ms, or `asyncio.sleep(0)` for cooperative yielding.
+  - If `try_write()` returns `False` (buffer full), the simulator retries up to `max_retries` with a brief `asyncio.sleep(backoff_delay)` between attempts. After exhausting retries, the order is counted as dropped — never crashes.
+- **SimulatorStats:**
+  - After the loop, `elapsed_time` is computed from `time.perf_counter()` wall-clock measurements. `achieved_rate` is strictly `orders_sent / elapsed_time` — never a target or fabricated number.
+
+---
+
+## 6. `chronosmatch/order_book.py` (Pure-Python Limit Order Book)
+
+### Why this module exists:
+The Limit Order Book (LOB) is the core matching logic of any exchange. This pure-Python reference implementation establishes the exact public API (`add_order`, `cancel_order`, `best_bid`, `best_ask`) that the Cython C-optimised engine will replicate on Day 3 — ensuring correctness can be verified before speed optimisation.
+
+### How it works:
+- **Price-Time Priority (FIFO) Algorithm:**
+  - *Price Priority:* On the bid side, the highest price matches first (a buyer willing to pay more has priority). On the ask side, the lowest price matches first (a seller offering the cheapest has priority).
+  - *Time Priority:* At each discrete price level, orders are queued in `collections.deque` in arrival order and consumed from the front (FIFO). The first order to arrive at a price is the first to be filled.
+- **Sorted Price Ladders via `bisect`:**
+  - `_bid_prices` is maintained in descending order (highest at index 0) so `_bid_prices[0]` is always the best bid. `_ask_prices` is ascending (lowest at index 0) so `_ask_prices[0]` is always the best ask.
+  - Insertions and removals use `bisect.bisect_right` / `bisect.bisect_left` for O(log N) position finding within the price list.
+- **`_BookOrder` Internal Container:**
+  - Uses `__slots__` to eliminate the per-instance `__dict__`, cutting memory overhead. The `quantity` field is mutated in-place during partial fills, avoiding object re-allocation.
+- **`add_order(order)` Matching Flow:**
+  1. Validate the incoming `OrderRecord` (positive price, positive quantity, valid side).
+  2. If BUY: walk the ask ladder starting from the best (lowest) ask. At each level, pop from the FIFO queue, create a `Trade` at the resting order's price, and deduct quantities. Stop when no more asks cross the buy limit price or buy quantity is exhausted.
+  3. If any buy quantity remains unfilled, rest it on the bid ladder.
+  4. SELL is the mirror: walk the bid ladder from the best (highest) bid downward.
+- **`cancel_order(order_id)`:**
+  - O(1) lookup in the `_orders` dict, then O(N_level) removal from the price-level deque. If the deque empties, the price level is pruned from the sorted list.
+- **`best_bid` / `best_ask` Dual Access:**
+  - A custom `_PriceAccessor` descriptor allows both `book.best_bid` (property-style) and `book.best_bid()` (method-style) to work, preventing calling convention mismatches between the Python reference and the future Cython implementation.
