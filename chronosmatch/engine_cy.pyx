@@ -38,6 +38,12 @@ Design Rationale (Plain English):
    Inside the matching loop, we write execution records directly to pre-allocated C
    memory (_trade_buffer). We only instantiate Python Trade NamedTuples once matching
    is complete at the return boundary, eliminating allocation overhead during crossing.
+
+6. Why Explicit Manual Deallocation (__dealloc__ and clear)?
+   Because all orders, levels, and hash buckets are allocated via malloc(), Python's
+   Garbage Collector cannot see or free this C memory. __dealloc__ safely walks every
+   ladder and bucket to free all memory when the CythonOrderBook is garbage collected,
+   preventing memory leaks and eliminating any risk of double-freeing.
 """
 
 from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
@@ -155,6 +161,84 @@ cdef class CythonOrderBook:
             free(self._hash_table)
             self._hash_table = NULL
             raise MemoryError("Failed to allocate trade execution buffer in CythonOrderBook.")
+
+    def __dealloc__(self):
+        """
+        Safely free all dynamically allocated C memory upon object destruction.
+
+        Prevents native memory leaks and avoids double-frees by checking NULL guards.
+        """
+        self.clear()
+
+        # Free C hash table bucket array
+        if self._hash_table != NULL:
+            free(self._hash_table)
+            self._hash_table = NULL
+
+        # Free trade scratch buffer
+        if self._trade_buffer != NULL:
+            free(self._trade_buffer)
+            self._trade_buffer = NULL
+
+    def clear(self) -> None:
+        """
+        Remove and deallocate all resting orders, price levels, and hash table entries.
+
+        Safe to call multiple times (idempotent).
+        """
+        cdef CyPriceLevel* curr_level
+        cdef CyPriceLevel* next_level
+        cdef CyOrder* curr_order
+        cdef CyOrder* next_order
+        cdef CyHashBucket* curr_bucket
+        cdef CyHashBucket* next_bucket
+        cdef uint32_t i
+
+        # 1. Clean up resting bids ladder
+        curr_level = self._bids_head
+        while curr_level != NULL:
+            next_level = curr_level.next_level
+            curr_order = curr_level.head_order
+            while curr_order != NULL:
+                next_order = curr_order.next_order
+                free(curr_order)
+                curr_order = next_order
+            free(curr_level)
+            curr_level = next_level
+
+        self._bids_head = NULL
+        self._bids_tail = NULL
+
+        # 2. Clean up resting asks ladder
+        curr_level = self._asks_head
+        while curr_level != NULL:
+            next_level = curr_level.next_level
+            curr_order = curr_level.head_order
+            while curr_order != NULL:
+                next_order = curr_order.next_order
+                free(curr_order)
+                curr_order = next_order
+            free(curr_level)
+            curr_level = next_level
+
+        self._asks_head = NULL
+        self._asks_tail = NULL
+
+        # 3. Clean up all chained hash table nodes
+        if self._hash_table != NULL:
+            for i in range(self._hash_capacity):
+                curr_bucket = self._hash_table[i]
+                while curr_bucket != NULL:
+                    next_bucket = curr_bucket.next_bucket
+                    free(curr_bucket)
+                    curr_bucket = next_bucket
+                self._hash_table[i] = NULL
+
+        # Reset counts
+        self._total_order_count = 0
+        self._bid_level_count = 0
+        self._ask_level_count = 0
+        self._trade_count = 0
 
     cdef inline uint32_t _hash_order_id(self, uint64_t order_id) noexcept nogil:
         """Fast multiplicative 64-bit integer hash for uniform bucket distribution."""
