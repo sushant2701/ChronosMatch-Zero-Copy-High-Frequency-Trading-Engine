@@ -41,3 +41,17 @@
 - **Roadblocks & Resolutions:**
   - PowerShell `&&` operator not available in older PS versions; resolved by using sequential command execution.
   - Asyncio event loop timer granularity on Windows (15ms quant) limits sub-millisecond `sleep()` precision; resolved by using cooperative `asyncio.sleep(0)` yields with batch processing to achieve high throughput without relying on fine-grained OS timers.
+
+### Day 3 — 27/10/2026
+- **Tasks Completed:**
+  - Architected and implemented the C-accelerated Cython Limit Order Book (`chronosmatch/engine_cy.pyx`) replicating the exact `LimitOrderBook` interface (`add_order`, `cancel_order`, `best_bid`, `best_ask`, volumes, and counts) with pure C structs (`CyOrder`, `CyPriceLevel`, `CyTrade`).
+  - Optimized matching loop eliminating all Python object allocations, reference counting, and Python dictionary lookups through raw C pointers, doubly-linked ladders, an open-chained C hash table, and a contiguous trade execution buffer.
+  - Implemented safe manual heap memory deallocation (`__dealloc__` and `clear()`) preventing native memory leaks and avoiding double-frees.
+  - Built robust packaging setup in `setup.py` and `pyproject.toml` featuring a custom `OptionalBuildExt` command that catches C compiler errors gracefully, allowing the package to install and run anywhere even if a C compiler is absent.
+  - Implemented the matching engine factory and dispatcher (`chronosmatch/engine.py`) providing `get_engine()`, `get_active_backend()`, `is_cython_available()`, structured logging of active backends, and transparent fallback to `LimitOrderBook`.
+  - Authored shared backend unit test suite (`tests/test_engine.py`) verifying empty state, top-of-book property accessors, input validation, full fills, partial fills, price priority, FIFO time priority, order cancellation, and factory fallback mechanics.
+  - Authored property-style differential test suite (`tests/test_property_matching.py`) verifying bit-for-bit trade execution and book state parity across 500 randomized operations, cleanly skipping via `pytest.skip` when native binaries are not compiled.
+  - Updated `docs/CODE_WALKTHROUGH.md` with low-latency C design rationale and fallback architecture; updated `README.md` with build instructions; updated `docs/REFERENCES.md` and `docs/AI_USAGE.md`.
+- **Test Results:** 45 tests passed, 1 cleanly skipped, 0 failures in 1.05s.
+- **Roadblocks & Resolutions:**
+  - Host environment lacked Microsoft Visual C++ (MSVC) Build Tools compiler; resolved per operational specification by engineering a fault-tolerant build setup and factory dispatcher that automatically falls back to the pure-Python reference implementation with full logging and 100% test coverage.

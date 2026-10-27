@@ -39,6 +39,15 @@ In adherence to the Infotact Solutions original work standards, all source code 
    - *Concept:* Maintaining sorted lists of active price levels using binary search insertion (`bisect.bisect_right`) and removal (`bisect.bisect_left`) for O(log N) operations.
    - *Design Choice:* Avoids the overhead of a full balanced tree implementation while still providing O(1) top-of-book access at index 0. Python's `bisect` module is implemented in C, delivering excellent constant-factor performance for moderate price level counts.
 
+8. **C-Level Struct Memory Layout & Manual Allocation for Low Latency**
+   - *Concept:* Allocating continuous C structs on heap (`malloc`/`free`) and eliminating `PyObject*` headers, reference count churn, and garbage collector tracking from the hot matching loop.
+   - *Design Choice:* In HFT order matching, garbage collection pauses and dynamic Python dictionary allocations create unacceptable tail latency jitter. Cython structs and doubly-linked ladder nodes provide deterministic execution.
+   - *Reference:* Behnel, S., Bradshaw, R., Citro, C., Dalcin, L., Seljebotn, D. S., & Smith, K. (2011). *Cython: The Best of Both Worlds*. Computing in Science & Engineering, 13(2), 31-39.
+
+9. **Graceful Build Degradation & Dynamic Backend Dispatch**
+   - *Concept:* Packaging native compiled extensions with a custom `build_ext` command catching compiler failures, paired with a runtime factory (`get_engine()`) catching `ImportError` and logging fallback status.
+   - *Design Choice:* Ensures cross-platform distribution and zero-dependency testing without requiring end-users to possess C++ toolchains on every machine.
+
 ---
 
 ## 2. Third-Party Libraries & Licensing
@@ -52,6 +61,7 @@ The following open-source dependencies are utilized for tooling, packaging, and 
 | **black** | `>=24.0.0` | MIT License | Deterministic PEP8 code formatter for Python sources. |
 | **flake8** | `>=7.0.0` | MIT License | Static code analysis and linting compliance. |
 | **Cython** | `>=3.0.0` | Apache 2.0 | C-extension compiler for high-performance order book matching loops. |
+| **setuptools** | `>=65.0.0` | MIT License | Package building, C extension compilation, and distribution. |
 | **windows-curses** | `>=2.3.3` | PDCurses / MIT | Windows compatibility port of the POSIX standard `curses` library for terminal rendering. |
 
 ---
@@ -70,6 +80,8 @@ The following standard library modules are central to ChronosMatch's architectur
 | `collections` | `deque` containers for O(1) FIFO time-priority queues at each price level. |
 | `time` | `perf_counter()` and `perf_counter_ns()` for nanosecond-precision benchmarking. |
 | `dataclasses` | Structured configuration and statistics containers with validation. |
+| `logging` | Enterprise structured logging declaring active backend and system events. |
+| `enum` | Typed enumeration for order sides and matching engine backends. |
 
 ---
 
@@ -81,7 +93,7 @@ The following standard library modules are central to ChronosMatch's architectur
   The mathematical modulo operation (`counter % capacity`) requires an integer division instruction, which consumes 10–30 CPU cycles. When `capacity` is a power of two, `counter & (capacity - 1)` compiles to a single-cycle bitwise AND operation.
 - **Why a fixed 29-byte struct?**  
   Fixed size guarantees that each slot's absolute memory offset is deterministically computed as `HEADER_SIZE + (slot_idx * SLOT_SIZE)`, eliminating any dynamic lookup or index tables.
-- **Why an isolated `random.Random` instance?**  
-  Using a module-level `random.random()` would share state with any other code that calls `random`. An isolated instance seeded in the constructor ensures that identical seeds always produce identical order sequences, regardless of what else runs in the process.
-- **Why `bisect` instead of `SortedList` or a tree?**  
-  Third-party sorted containers (`sortedcontainers.SortedList`) add an external dependency. Python's built-in `bisect` module is implemented in C and handles the moderate number of distinct price levels (typically hundreds, not millions) with excellent performance and zero added dependencies.
+- **Why Cython structs and manual memory?**  
+  Eliminating `PyObject` headers saves 16+ bytes per order and removes reference counting and garbage collector sweeps from the matching loop. A dedicated C hash table provides O(1) order cancellation without Python dict overhead.
+- **Why automatic fallback to pure Python?**  
+  Developer workstations and continuous integration environments frequently lack native C compilers (MSVC on Windows, GCC on minimal containers). Automatic fallback preserves 100% testability and functionality everywhere.

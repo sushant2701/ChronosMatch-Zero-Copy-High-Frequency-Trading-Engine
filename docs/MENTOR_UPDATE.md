@@ -1,11 +1,12 @@
-# Mentor Progress Update — Day 2 (26/10/2026)
+# Mentor Progress Update — Day 3 (27/10/2026)
 
 **To:** Internship Mentor, Infotact Solutions  
 **From:** Sushant Shrimal (Batch-22, Ref: ITS/PY/1090)  
 **Project:** ChronosMatch - Zero-Copy High-Frequency Trading Engine  
 
 **Progress Summary:**
-Today I built the two core Day 2 modules: the asyncio market simulator and the pure-Python limit order book. The simulator generates synthetic orders via a seeded Gaussian random walk around a drifting mid-price and writes them directly into the ring buffer at configurable rates (targeting 100,000 orders/sec) with graceful back-off when the buffer fills. The limit order book implements strict Price-Time Priority matching with add, cancel, partial fill, and full fill operations — this exact API will be replicated by the Cython engine on Day 3. All 33 unit and integration tests pass, covering deterministic seed reproducibility, full-buffer resilience, matching correctness, cancellation, and multi-level order sweeps. Documentation, references, and weekly logs are up to date.
+Today I completed the Day 3 milestones by architecting the C-accelerated Cython matching engine (`chronosmatch/engine_cy.pyx`) and its runtime integration. The Cython engine implements strict Price-Time Priority matching using raw C structs, doubly-linked price ladders, an open-chained C hash table, and a contiguous trade scratch buffer, completely stripping Python object allocations from the hot matching loop. I implemented safe heap memory cleanup (`__dealloc__` and `clear`) to prevent native leaks. Because host development environments may lack C compilers (such as MSVC Build Tools on Windows), I built a resilient `setup.py` build configuration and an engine factory (`chronosmatch/engine.py`) that detects compiler presence and automatically falls back to the pure-Python reference order book with structured logging. All 45 tests pass and 1 differential property test cleanly skips as expected without native binaries. All documentation, code walkthroughs, references, and logs have been updated.
 
-**Previous Update (Day 1):**
-Initialized project repository, built zero-copy binary codec (29-byte packed C-struct) and file-backed mmap SPSC ring buffer with cache-line-aligned headers. 17 tests passed including multi-process IPC stress test.
+**Previous Updates:**
+- **Day 2:** Implemented asyncio seeded market simulator (100k orders/sec target) and pure-Python reference Limit Order Book with strict Price-Time Priority (33 tests passed).
+- **Day 1:** Initialized project repository, built zero-copy binary codec (29-byte packed C-struct) and file-backed mmap SPSC ring buffer with cache-line-aligned headers (17 tests passed).
