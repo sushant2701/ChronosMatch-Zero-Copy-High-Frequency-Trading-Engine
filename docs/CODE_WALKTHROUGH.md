@@ -110,3 +110,38 @@ The Limit Order Book (LOB) is the core matching logic of any exchange. This pure
   - O(1) lookup in the `_orders` dict, then O(N_level) removal from the price-level deque. If the deque empties, the price level is pruned from the sorted list.
 - **`best_bid` / `best_ask` Dual Access:**
   - A custom `_PriceAccessor` descriptor allows both `book.best_bid` (property-style) and `book.best_bid()` (method-style) to work, preventing calling convention mismatches between the Python reference and the future Cython implementation.
+
+---
+
+## 7. `chronosmatch/engine_cy.pyx` (Cython C-Accelerated Matching Engine)
+
+### Why this module exists:
+Python's interpreted execution, object allocation overhead, dynamic dispatch, and garbage collection (GC) introduce multi-microsecond latency spikes (jitter) that are prohibitive in algorithmic trading. `engine_cy.pyx` replaces Python objects inside the hot matching loop with pure C structs and direct pointers.
+
+### Why C types are faster:
+1. **Zero `PyObject` Overhead:** Every Python object requires a 16-byte header (`ob_refcnt`, `ob_type`), reference counting operations, and GC tracking. Cython C structs (`CyOrder`, `CyPriceLevel`, `CyTrade`) allocate pure, compact C memory on the heap with zero GC interaction.
+2. **Contiguous and Linked Memory Layout:**
+   - Resting orders within a price level form a doubly-linked FIFO queue (`CyOrder* head_order`, `CyOrder* tail_order`). Appending new orders, popping fully filled orders, and unlinking canceled orders are all strict O(1) pointer operations without array copying.
+   - Price levels are linked in a sorted doubly-linked list (`_bids_head` descending, `_asks_head` ascending). Because market quotes cluster tightly around the spread, walking the ladder takes few or zero steps in practice.
+3. **C Hash Table for O(1) Cancellation:**
+   - Rather than calling Python `dict` methods, a lightweight open-chained C hash table with power-of-two bitmask indexing maps 64-bit `order_id` to `CyOrder*` in single-digit nanoseconds.
+4. **Preallocated Trade Scratch Buffer:**
+   - Inside the matching loop, execution records are written directly to a reusable contiguous array of `CyTrade` structs (`_trade_buffer`). Python `Trade` namedtuples are instantiated only at the boundary when returning from `add_order()`.
+5. **Memory Safety and Deterministic Deallocation:**
+   - `__dealloc__` and `clear()` systematically traverse all ladders and hash table buckets to `free()` every allocated node, guaranteeing zero memory leaks, no dangling pointers, and no double-free errors.
+
+---
+
+## 8. `chronosmatch/engine.py` (Factory & Dynamic Fallback Dispatcher)
+
+### Why this module exists:
+To achieve true cross-platform portability across development machines (e.g. environments without MSVC Build Tools or C compilers), the matching engine must transparently adapt without breaking client code or test suites.
+
+### How it works:
+- **`get_engine(backend=None)` Factory:**
+  - Evaluates whether `chronosmatch.engine_cy` compiled successfully at import time.
+  - If Cython is available, instantiates `CythonOrderBook` and logs an informational notice.
+  - If Cython is missing or failed to compile (e.g. missing MSVC compiler on Windows), it catches the `ImportError` gracefully, logs an informational notice declaring that the pure-Python reference `LimitOrderBook` is active, and returns an instance of `LimitOrderBook`.
+  - Supports explicit backend overrides (`backend="cython"` or `backend="python"`), allowing test harnesses and benchmarks to target a specific backend on demand.
+- **Identical Public API:**
+  - Both backends implement the exact same methods, properties, and exceptions (`add_order`, `cancel_order`, `best_bid`, `best_ask`, `order_count`, `InvalidOrderError`, `OrderNotFoundError`). Calling code never needs to know which backend is executing underneath.
