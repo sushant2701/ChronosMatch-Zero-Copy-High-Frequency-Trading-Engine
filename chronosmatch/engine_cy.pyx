@@ -33,6 +33,11 @@ Design Rationale (Plain English):
    Pure Python dicts incur hashing and PyObject pointer chasing. A dedicated C-level
    chained hash table maps uint64 order_id -> CyOrder* in constant time without
    calling any Python C-API functions during cancel operations.
+
+5. Why Reusable C Trade Buffer?
+   Inside the matching loop, we write execution records directly to pre-allocated C
+   memory (_trade_buffer). We only instantiate Python Trade NamedTuples once matching
+   is complete at the return boundary, eliminating allocation overhead during crossing.
 """
 
 from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
@@ -83,7 +88,7 @@ cdef struct CyHashBucket:
 
 
 # ---------------------------------------------------------------------------
-# Cython Limit Order Book Class Scaffold
+# Cython Limit Order Book Class
 # ---------------------------------------------------------------------------
 
 cdef class CythonOrderBook:
@@ -154,6 +159,378 @@ cdef class CythonOrderBook:
     cdef inline uint32_t _hash_order_id(self, uint64_t order_id) noexcept nogil:
         """Fast multiplicative 64-bit integer hash for uniform bucket distribution."""
         return <uint32_t>((order_id * 11400714819323198485ULL) & self._hash_mask)
+
+    cdef inline void _record_trade(self, uint64_t buy_id, uint64_t sell_id, int64_t price, uint32_t qty) noexcept nogil:
+        """Record trade match into contiguous C memory buffer without Python object creation."""
+        cdef uint32_t new_cap
+        cdef CyTrade* new_buf
+        if self._trade_count >= self._trade_capacity:
+            new_cap = self._trade_capacity * 2
+            new_buf = <CyTrade*>realloc(self._trade_buffer, new_cap * sizeof(CyTrade))
+            if new_buf != NULL:
+                self._trade_buffer = new_buf
+                self._trade_capacity = new_cap
+            else:
+                return  # Safe fallback if reallocation fails under extreme memory stress
+
+        self._trade_buffer[self._trade_count].buy_order_id = buy_id
+        self._trade_buffer[self._trade_count].sell_order_id = sell_id
+        self._trade_buffer[self._trade_count].price = price
+        self._trade_buffer[self._trade_count].quantity = qty
+        self._trade_count += 1
+
+    cdef inline void _index_order(self, uint64_t order_id, CyOrder* order) noexcept nogil:
+        """Insert order pointer into C hash table for O(1) cancel lookup."""
+        cdef uint32_t bucket = self._hash_order_id(order_id)
+        cdef CyHashBucket* node = <CyHashBucket*>malloc(sizeof(CyHashBucket))
+        if node != NULL:
+            node.order_id = order_id
+            node.order = order
+            node.next_bucket = self._hash_table[bucket]
+            self._hash_table[bucket] = node
+
+    cdef inline CyOrder* _find_order(self, uint64_t order_id) noexcept nogil:
+        """Locate resting order pointer by ID in O(1) time without Python dicts."""
+        cdef uint32_t bucket = self._hash_order_id(order_id)
+        cdef CyHashBucket* curr = self._hash_table[bucket]
+        while curr != NULL:
+            if curr.order_id == order_id:
+                return curr.order
+            curr = curr.next_bucket
+        return NULL
+
+    cdef inline void _unindex_order(self, uint64_t order_id) noexcept nogil:
+        """Remove order pointer from C hash table upon fill or cancellation."""
+        cdef uint32_t bucket = self._hash_order_id(order_id)
+        cdef CyHashBucket* curr = self._hash_table[bucket]
+        cdef CyHashBucket* prev = NULL
+        while curr != NULL:
+            if curr.order_id == order_id:
+                if prev == NULL:
+                    self._hash_table[bucket] = curr.next_bucket
+                else:
+                    prev.next_bucket = curr.next_bucket
+                free(curr)
+                return
+            prev = curr
+            curr = curr.next_bucket
+
+    cdef inline CyPriceLevel* _find_or_create_bid_level(self, int64_t price) noexcept nogil:
+        """Find or insert bid price level into descending sorted doubly-linked list."""
+        cdef CyPriceLevel* curr = self._bids_head
+        cdef CyPriceLevel* new_level
+
+        # Walk descending list: highest price at head
+        while curr != NULL:
+            if curr.price == price:
+                return curr
+            if curr.price < price:
+                # Insert before curr (higher price goes closer to head)
+                new_level = <CyPriceLevel*>malloc(sizeof(CyPriceLevel))
+                new_level.price = price
+                new_level.total_volume = 0
+                new_level.order_count = 0
+                new_level.head_order = NULL
+                new_level.tail_order = NULL
+                new_level.next_level = curr
+                new_level.prev_level = curr.prev_level
+
+                if curr.prev_level != NULL:
+                    curr.prev_level.next_level = new_level
+                else:
+                    self._bids_head = new_level
+                curr.prev_level = new_level
+
+                self._bid_level_count += 1
+                return new_level
+
+            if curr.next_level == NULL:
+                # Insert at tail (lowest bid seen so far)
+                break
+            curr = curr.next_level
+
+        # Append at tail or initialize empty ladder
+        new_level = <CyPriceLevel*>malloc(sizeof(CyPriceLevel))
+        new_level.price = price
+        new_level.total_volume = 0
+        new_level.order_count = 0
+        new_level.head_order = NULL
+        new_level.tail_order = NULL
+        new_level.next_level = NULL
+        new_level.prev_level = curr
+
+        if curr != NULL:
+            curr.next_level = new_level
+            self._bids_tail = new_level
+        else:
+            self._bids_head = new_level
+            self._bids_tail = new_level
+
+        self._bid_level_count += 1
+        return new_level
+
+    cdef inline CyPriceLevel* _find_or_create_ask_level(self, int64_t price) noexcept nogil:
+        """Find or insert ask price level into ascending sorted doubly-linked list."""
+        cdef CyPriceLevel* curr = self._asks_head
+        cdef CyPriceLevel* new_level
+
+        # Walk ascending list: lowest price at head
+        while curr != NULL:
+            if curr.price == price:
+                return curr
+            if curr.price > price:
+                # Insert before curr (lower price goes closer to head)
+                new_level = <CyPriceLevel*>malloc(sizeof(CyPriceLevel))
+                new_level.price = price
+                new_level.total_volume = 0
+                new_level.order_count = 0
+                new_level.head_order = NULL
+                new_level.tail_order = NULL
+                new_level.next_level = curr
+                new_level.prev_level = curr.prev_level
+
+                if curr.prev_level != NULL:
+                    curr.prev_level.next_level = new_level
+                else:
+                    self._asks_head = new_level
+                curr.prev_level = new_level
+
+                self._ask_level_count += 1
+                return new_level
+
+            if curr.next_level == NULL:
+                break
+            curr = curr.next_level
+
+        # Append at tail or initialize empty ladder
+        new_level = <CyPriceLevel*>malloc(sizeof(CyPriceLevel))
+        new_level.price = price
+        new_level.total_volume = 0
+        new_level.order_count = 0
+        new_level.head_order = NULL
+        new_level.tail_order = NULL
+        new_level.next_level = NULL
+        new_level.prev_level = curr
+
+        if curr != NULL:
+            curr.next_level = new_level
+            self._asks_tail = new_level
+        else:
+            self._asks_head = new_level
+            self._asks_tail = new_level
+
+        self._ask_level_count += 1
+        return new_level
+
+    cdef inline void _remove_level(self, CyPriceLevel* level, bint is_bid) noexcept nogil:
+        """Unlink and free an empty price level from the active ladder."""
+        if level.prev_level != NULL:
+            level.prev_level.next_level = level.next_level
+        else:
+            if is_bid:
+                self._bids_head = level.next_level
+            else:
+                self._asks_head = level.next_level
+
+        if level.next_level != NULL:
+            level.next_level.prev_level = level.prev_level
+        else:
+            if is_bid:
+                self._bids_tail = level.prev_level
+            else:
+                self._asks_tail = level.prev_level
+
+        if is_bid:
+            self._bid_level_count -= 1
+        else:
+            self._ask_level_count -= 1
+
+        free(level)
+
+    cdef inline void _insert_resting_order(self, CyPriceLevel* level, CyOrder* order) noexcept nogil:
+        """Append resting order to tail of price level (FIFO time priority)."""
+        order.parent_level = level
+        order.next_order = NULL
+        order.prev_order = level.tail_order
+
+        if level.tail_order != NULL:
+            level.tail_order.next_order = order
+            level.tail_order = order
+        else:
+            level.head_order = order
+            level.tail_order = order
+
+        level.order_count += 1
+        level.total_volume += order.quantity
+        self._total_order_count += 1
+        self._index_order(order.order_id, order)
+
+    def _validate_order(self, order: OrderRecord) -> None:
+        """Validate order attributes before processing."""
+        if not isinstance(order, OrderRecord):
+            raise InvalidOrderError(f"Expected OrderRecord instance, got {type(order).__name__}.")
+        if order.quantity <= 0:
+            raise InvalidOrderError(f"Order quantity must be strictly positive, got {order.quantity}.")
+        if order.price <= 0:
+            raise InvalidOrderError(f"Order price must be strictly positive, got {order.price}.")
+        if order.side not in (OrderSide.BUY.value, OrderSide.SELL.value):
+            raise InvalidOrderError(f"Invalid order side {order.side}.")
+
+    def add_order(self, order: OrderRecord) -> List[Trade]:
+        """
+        Process an incoming limit order with strict Price-Time Priority matching.
+
+        Pure C execution inside matching loop:
+        - Traverses C price level linked list.
+        - Matches against FIFO resting orders at passive resting price.
+        - Records trade records directly into preallocated C memory.
+        - Rest any remaining quantity as raw C struct.
+        - Converts trades to Python Trade objects only at final return.
+        """
+        self._validate_order(order)
+
+        cdef uint64_t order_id = order.order_id
+        cdef uint8_t side = order.side
+        cdef int64_t price = order.price
+        cdef uint32_t remaining_qty = order.quantity
+        cdef uint64_t timestamp_ns = order.timestamp_ns
+
+        cdef CyPriceLevel* curr_level
+        cdef CyPriceLevel* next_level
+        cdef CyOrder* resting
+        cdef CyOrder* next_resting
+        cdef uint32_t match_qty
+        cdef int64_t trade_price
+        cdef CyOrder* new_order
+        cdef CyPriceLevel* resting_level
+
+        # Reset trade scratch buffer
+        self._trade_count = 0
+
+        if side == 1:  # BUY
+            # Cross against resting asks (ascending price priority)
+            curr_level = self._asks_head
+            while remaining_qty > 0 and curr_level != NULL:
+                if curr_level.price > price:
+                    # Best ask is higher than incoming buy limit price: match stop
+                    break
+
+                resting = curr_level.head_order
+                while resting != NULL and remaining_qty > 0:
+                    next_resting = resting.next_order
+                    match_qty = remaining_qty if remaining_qty < resting.quantity else resting.quantity
+                    trade_price = resting.price
+
+                    self._record_trade(order_id, resting.order_id, trade_price, match_qty)
+
+                    remaining_qty -= match_qty
+                    resting.quantity -= match_qty
+                    curr_level.total_volume -= match_qty
+
+                    if resting.quantity == 0:
+                        # Full fill: remove resting order
+                        if resting.prev_order != NULL:
+                            resting.prev_order.next_order = resting.next_order
+                        else:
+                            curr_level.head_order = resting.next_order
+
+                        if resting.next_order != NULL:
+                            resting.next_order.prev_order = resting.prev_order
+                        else:
+                            curr_level.tail_order = resting.prev_order
+
+                        self._unindex_order(resting.order_id)
+                        free(resting)
+                        curr_level.order_count -= 1
+                        self._total_order_count -= 1
+
+                    resting = next_resting
+
+                next_level = curr_level.next_level
+                if curr_level.order_count == 0:
+                    self._remove_level(curr_level, 0)
+                curr_level = next_level
+
+            # Rest any remaining unfilled quantity on the bid ladder
+            if remaining_qty > 0:
+                resting_level = self._find_or_create_bid_level(price)
+                new_order = <CyOrder*>malloc(sizeof(CyOrder))
+                new_order.order_id = order_id
+                new_order.side = side
+                new_order.price = price
+                new_order.quantity = remaining_qty
+                new_order.timestamp_ns = timestamp_ns
+                self._insert_resting_order(resting_level, new_order)
+
+        else:  # SELL
+            # Cross against resting bids (descending price priority)
+            curr_level = self._bids_head
+            while remaining_qty > 0 and curr_level != NULL:
+                if curr_level.price < price:
+                    # Best bid is lower than incoming sell limit price: match stop
+                    break
+
+                resting = curr_level.head_order
+                while resting != NULL and remaining_qty > 0:
+                    next_resting = resting.next_order
+                    match_qty = remaining_qty if remaining_qty < resting.quantity else resting.quantity
+                    trade_price = resting.price
+
+                    self._record_trade(resting.order_id, order_id, trade_price, match_qty)
+
+                    remaining_qty -= match_qty
+                    resting.quantity -= match_qty
+                    curr_level.total_volume -= match_qty
+
+                    if resting.quantity == 0:
+                        # Full fill: remove resting order
+                        if resting.prev_order != NULL:
+                            resting.prev_order.next_order = resting.next_order
+                        else:
+                            curr_level.head_order = resting.next_order
+
+                        if resting.next_order != NULL:
+                            resting.next_order.prev_order = resting.prev_order
+                        else:
+                            curr_level.tail_order = resting.prev_order
+
+                        self._unindex_order(resting.order_id)
+                        free(resting)
+                        curr_level.order_count -= 1
+                        self._total_order_count -= 1
+
+                    resting = next_resting
+
+                next_level = curr_level.next_level
+                if curr_level.order_count == 0:
+                    self._remove_level(curr_level, 1)
+                curr_level = next_level
+
+            # Rest any remaining unfilled quantity on the ask ladder
+            if remaining_qty > 0:
+                resting_level = self._find_or_create_ask_level(price)
+                new_order = <CyOrder*>malloc(sizeof(CyOrder))
+                new_order.order_id = order_id
+                new_order.side = side
+                new_order.price = price
+                new_order.quantity = remaining_qty
+                new_order.timestamp_ns = timestamp_ns
+                self._insert_resting_order(resting_level, new_order)
+
+        # Convert C trade records to Python Trade namedtuples at return boundary
+        cdef list trades = []
+        cdef uint32_t i
+        for i in range(self._trade_count):
+            trades.append(
+                Trade(
+                    buy_order_id=self._trade_buffer[i].buy_order_id,
+                    sell_order_id=self._trade_buffer[i].sell_order_id,
+                    price=self._trade_buffer[i].price,
+                    quantity=self._trade_buffer[i].quantity,
+                )
+            )
+
+        return trades
 
     @property
     def order_count(self) -> int:
