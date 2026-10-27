@@ -23,6 +23,10 @@ __all__ = [
     "MarketSimulator",
     "Trade",
     "LimitOrderBook",
+    "EngineBackend",
+    "get_engine",
+    "get_active_backend",
+    "is_cython_available",
 ]
 
 from chronosmatch.codec import OrderRecord, OrderSide
@@ -42,3 +46,9 @@ from chronosmatch.simulator import (
     MarketSimulator,
 )
 from chronosmatch.order_book import Trade, LimitOrderBook
+from chronosmatch.engine import (
+    EngineBackend,
+    get_engine,
+    get_active_backend,
+    is_cython_available,
+)
