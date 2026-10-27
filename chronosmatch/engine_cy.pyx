@@ -171,7 +171,7 @@ cdef class CythonOrderBook:
                 self._trade_buffer = new_buf
                 self._trade_capacity = new_cap
             else:
-                return  # Safe fallback if reallocation fails under extreme memory stress
+                return
 
         self._trade_buffer[self._trade_count].buy_order_id = buy_id
         self._trade_buffer[self._trade_count].sell_order_id = sell_id
@@ -245,7 +245,6 @@ cdef class CythonOrderBook:
                 return new_level
 
             if curr.next_level == NULL:
-                # Insert at tail (lowest bid seen so far)
                 break
             curr = curr.next_level
 
@@ -531,6 +530,114 @@ cdef class CythonOrderBook:
             )
 
         return trades
+
+    def cancel_order(self, uint64_t order_id) -> None:
+        """
+        Cancel a resting order in the book by order ID.
+
+        Removes the order from its resting price ladder and index in O(1) time.
+
+        Raises:
+            OrderNotFoundError: If order_id is not actively resting in the book.
+        """
+        cdef CyOrder* order = self._find_order(order_id)
+        if order == NULL:
+            raise OrderNotFoundError(f"Order ID {order_id} not found in order book.")
+
+        cdef CyPriceLevel* level = order.parent_level
+        cdef bint is_bid = (order.side == 1)
+
+        # Unlink order from level FIFO queue in O(1)
+        if order.prev_order != NULL:
+            order.prev_order.next_order = order.next_order
+        else:
+            level.head_order = order.next_order
+
+        if order.next_order != NULL:
+            order.next_order.prev_order = order.prev_order
+        else:
+            level.tail_order = order.prev_order
+
+        level.order_count -= 1
+        level.total_volume -= order.quantity
+        self._total_order_count -= 1
+
+        self._unindex_order(order_id)
+        free(order)
+
+        # Remove price level if empty
+        if level.order_count == 0:
+            self._remove_level(level, is_bid)
+
+    def _get_best_bid_value(self) -> Optional[int]:
+        """Internal helper returning integer best bid or None."""
+        if self._bids_head != NULL:
+            return self._bids_head.price
+        return None
+
+    def _get_best_ask_value(self) -> Optional[int]:
+        """Internal helper returning integer best ask or None."""
+        if self._asks_head != NULL:
+            return self._asks_head.price
+        return None
+
+    @_PriceAccessor
+    def best_bid(self) -> Optional[int]:
+        """Return the highest resting bid price in ticks, or None if no resting bids."""
+        return self._get_best_bid_value()
+
+    @_PriceAccessor
+    def best_ask(self) -> Optional[int]:
+        """Return the lowest resting ask price in ticks, or None if no resting asks."""
+        return self._get_best_ask_value()
+
+    def get_best_bid(self) -> Optional[int]:
+        """Direct getter returning raw Optional[int] for best bid price."""
+        return self._get_best_bid_value()
+
+    def get_best_ask(self) -> Optional[int]:
+        """Direct getter returning raw Optional[int] for best ask price."""
+        return self._get_best_ask_value()
+
+    def bid_volume_at(self, int64_t price) -> int:
+        """Calculate total resting volume at a specific bid price tick."""
+        cdef CyPriceLevel* curr = self._bids_head
+        while curr != NULL:
+            if curr.price == price:
+                return curr.total_volume
+            if curr.price < price:
+                break
+            curr = curr.next_level
+        return 0
+
+    def ask_volume_at(self, int64_t price) -> int:
+        """Calculate total resting volume at a specific ask price tick."""
+        cdef CyPriceLevel* curr = self._asks_head
+        while curr != NULL:
+            if curr.price == price:
+                return curr.total_volume
+            if curr.price > price:
+                break
+            curr = curr.next_level
+        return 0
+
+    def total_bid_volume(self) -> int:
+        """Calculate aggregate resting volume across all bid levels."""
+        cdef uint64_t total = 0
+        cdef CyPriceLevel* curr = self._bids_head
+        while curr != NULL:
+            total += curr.total_volume
+            curr = curr.next_level
+        return total
+
+    def total_ask_volume(self) -> int:
+        """Calculate aggregate resting volume across all ask levels."""
+        cdef uint64_t total = 0
+        cdef CyPriceLevel* curr = self._asks_head
+        while curr != NULL:
+            total += curr.total_volume
+            curr = curr.next_level
+        return total
 
     @property
     def order_count(self) -> int:
