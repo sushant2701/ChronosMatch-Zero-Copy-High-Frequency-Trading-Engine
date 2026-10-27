@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=65.0.0", "wheel", "Cython>=3.0.0"]
+# Cython is optional; setuptools and wheel are required for pure-Python fallback installation
+requires = ["setuptools>=65.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,6 +24,10 @@ dev = [
     "black>=24.0.0",
     "flake8>=7.0.0",
     "cython>=3.0.0",
+]
+cython = [
+    "cython>=3.0.0",
+    "setuptools>=65.0.0",
 ]
 
 [tool.pytest.ini_options]
